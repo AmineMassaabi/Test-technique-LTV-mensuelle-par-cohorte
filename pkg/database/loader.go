@@ -10,14 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"ltv-monthly/pkg/models"
-
 	_ "github.com/go-sql-driver/mysql"
 )
 
 const orderEventTypeID = 6 // "Commande"
 
-// Open DSN mariadb:// ou mysql:// → format MySQL driver
+// Open DSN mariadb:// ou mysql:// → DSN driver MySQL avec loc=UTC
 func Open(dsn string) (*sql.DB, string, error) {
 	mysqlDSN, err := toMySQLDSN(dsn)
 	if err != nil {
@@ -51,33 +49,32 @@ func toMySQLDSN(dsn string) (string, error) {
 		if user == "" || host == "" || db == "" {
 			return "", fmt.Errorf("dsn incomplet (user/host/db)")
 		}
-		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=Local&interpolateParams=true",
+		// loc=UTC pour cohérence avec nos bornes UTC
+		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&interpolateParams=true",
 			user, pass, host, db), nil
 	}
 	return dsn, nil
 }
 
-// ComputeCohortAvgFromDigest (DATETIME-safe)
-// Montant = Digest.price.originalUnitPrice × Quantity
 func ComputeCohortAvgFromDigest(
 	ctx context.Context,
 	db *sql.DB,
 	tableName string,
 	cohortStart, cohortEnd, periodStart, periodEnd time.Time,
-) (sql.NullFloat64, error) {
+) (sql.NullFloat64, int, int, int, error) {
 
 	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(tableName) {
-		return sql.NullFloat64{}, fmt.Errorf("table invalide")
+		return sql.NullFloat64{}, 0, 0, 0, fmt.Errorf("table invalide")
 	}
 
-	// Always work in UTC and format as MySQL DATETIME strings
+	// Bornes DATETIME en UTC
 	const layout = "2006-01-02 15:04:05"
 	cStart := cohortStart.UTC().Format(layout)
 	cEnd := cohortEnd.UTC().Format(layout)
 	pStart := periodStart.UTC().Format(layout)
 	pEnd := periodEnd.UTC().Format(layout)
 
-	// 1) Sous-requête cohorte : première commande dans [cohortStart, cohortEnd)
+	// Sous-requête: clients dont la 1re commande est dans la fenêtre de cohorte
 	subCohort := fmt.Sprintf(`
 		SELECT ced.CustomerID
 		FROM %s ced
@@ -86,94 +83,66 @@ func ComputeCohortAvgFromDigest(
 		HAVING MIN(ced.EventDate) >= ? AND MIN(ced.EventDate) < ?
 	`, tableName)
 
-	// 2) Événements commande des clients de la cohorte dans [periodStart, periodEnd)
-	q := fmt.Sprintf(`
-		SELECT
-			ced.CustomerID,
-			COALESCE(ced.Quantity, 1) AS quantity,
-			ced.Digest AS digestJSON
+	// 1) Nombre de clients de cohorte
+	countCohortQ := fmt.Sprintf(`SELECT COUNT(*) FROM (%s) x`, subCohort)
+	var cohortClients int
+	if err := db.QueryRowContext(ctx, countCohortQ, orderEventTypeID, cStart, cEnd).Scan(&cohortClients); err != nil {
+		return sql.NullFloat64{}, 0, 0, 0, err
+	}
+	if cohortClients == 0 {
+		// Rien à calculer ; remonter compteurs à 0
+		return sql.NullFloat64{Valid: false}, 0, 0, 0, nil
+	}
+
+	// 2) Statistiques d'événements + somme des montants
+	// price_val = CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6))
+	statsQ := fmt.Sprintf(`
+	SELECT
+		CAST(COUNT(*) AS UNSIGNED) AS events_read,
+		CAST(SUM(
+			CASE
+				WHEN CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6)) > 0
+				THEN 1 ELSE 0
+			END
+		) AS UNSIGNED) AS events_with_price,
+		SUM(
+			IFNULL(CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6)), 0)
+			* COALESCE(ced.Quantity, 1)
+		) AS gross_total
 		FROM %s ced
 		WHERE ced.EventTypeID = ?
 		  AND ced.EventDate >= ? AND ced.EventDate < ?
 		  AND ced.CustomerID IN (%s)
 	`, tableName, subCohort)
 
-	// Args alignés avec les "?" :
+	var eventsRead int
+	var eventsWithPrice int
+	var grossTotal sql.NullFloat64
+
 	args := []any{
-		// période d'observation (requête principale)
+		// principale (période d'observation)
 		orderEventTypeID, pStart, pEnd,
-		// fenêtre de cohorte (sous-requête)
+		// sous-requête cohorte
 		orderEventTypeID, cStart, cEnd,
 	}
+	log.Printf(cStart, cEnd, pStart, pEnd)
 
-	// ---- logs bornes ----
-	log.Printf("[DEBUG] Boundaries UTC: cohort=[%s ; %s) / period=[%s ; %s)", cStart, cEnd, pStart, pEnd)
-
-	// Compter les clients de cohorte (debug)
-	countCohortQ := fmt.Sprintf(`SELECT COUNT(*) FROM (%s) x`, subCohort)
-	var cohortClients int
-	if err := db.QueryRowContext(ctx, countCohortQ, orderEventTypeID, cStart, cEnd).Scan(&cohortClients); err == nil {
-		log.Printf("[DEBUG] Clients de cohorte trouvés: %d", cohortClients)
-	} else {
-		log.Printf("[DEBUG] Cohort count error: %v", err)
+	if err := db.QueryRowContext(ctx, statsQ, args...).Scan(&eventsRead, &eventsWithPrice, &grossTotal); err != nil {
+		return sql.NullFloat64{}, cohortClients, 0, 0, err
 	}
 
-	rows, err := db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return sql.NullFloat64{}, err
+	if !grossTotal.Valid {
+		return sql.NullFloat64{Valid: false}, cohortClients, eventsRead, eventsWithPrice, nil
 	}
-	defer rows.Close()
-
-	countEvents := 0
-	parsedOK := 0
-	sumByClient := map[uint64]float64{}
-
-	for rows.Next() {
-		countEvents++
-		var (
-			customerID uint64
-			qty        sql.NullInt64
-			digestJSON sql.NullString
-		)
-		if err := rows.Scan(&customerID, &qty, &digestJSON); err != nil {
-			return sql.NullFloat64{}, err
-		}
-
-		ev := models.EventData{
-			ClientCustomerID: customerID,
-			Quantity:         1,
-			DigestJSON:       digestJSON,
-		}
-		if qty.Valid && qty.Int64 > 0 {
-			ev.Quantity = int(qty.Int64)
-		}
-
-		unit, err := ev.UnitPrice() // Digest.price.originalUnitPrice
-		if err != nil {
-			log.Printf("[DEBUG] JSON parse error client=%d err=%v raw=%s", customerID, err, digestJSON.String)
-			continue
-		}
-		if unit <= 0 {
-			log.Printf("[DEBUG] unit price <= 0 client=%d raw=%s", customerID, digestJSON.String)
-			continue
-		}
-		parsedOK++
-		sumByClient[customerID] += unit * float64(ev.Quantity)
-	}
-	if err := rows.Err(); err != nil {
-		return sql.NullFloat64{}, err
+	ltv := sql.NullFloat64{
+		Float64: grossTotal.Float64 / float64(cohortClients),
+		Valid:   true,
 	}
 
-	log.Printf("[DEBUG] Events lus=%d, events avec prix OK=%d, clients agrégés=%d",
-		countEvents, parsedOK, len(sumByClient),
+	// Logs de debug (optionnels)
+	log.Printf("[DEBUG] Cohort clients=%d | events=%d | priced=%d | gross=%.6f | ltv=%.6f",
+		cohortClients, eventsRead, eventsWithPrice, grossTotal.Float64, ltv.Float64,
 	)
 
-	if len(sumByClient) == 0 {
-		return sql.NullFloat64{Valid: false}, nil
-	}
-	total := 0.0
-	for _, v := range sumByClient {
-		total += v
-	}
-	return sql.NullFloat64{Float64: total / float64(len(sumByClient)), Valid: true}, nil
+	return ltv, cohortClients, eventsRead, eventsWithPrice, nil
 }

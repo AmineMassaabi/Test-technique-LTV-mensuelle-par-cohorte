@@ -13,22 +13,15 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-type Config struct {
-	StartMonthInclusive string // "MMYYYY"
-	EndMonthInclusive   string // "MMYYYY"
-	Observation         time.Time
-	Verbose             bool
-}
 
 const tableName = "CustomerEventData"
 
-// Run parcourt les mois et calcule la LTV moyenne "à date" (Digest Price × Quantity)
-func Run(ctx context.Context, db *sql.DB, cfg Config) ([]models.CohortResult, error) {
-	start, err := parseMonth(cfg.StartMonthInclusive) // -> UTC
+func Run(ctx context.Context, db *sql.DB, cfg models.Config) ([]models.CohortResult, error) {
+	start, err := parseMonth(cfg.StartMonthInclusive)
 	if err != nil {
 		return nil, fmt.Errorf("start_month: %w", err)
 	}
-	end, err := parseMonth(cfg.EndMonthInclusive) // -> UTC
+	end, err := parseMonth(cfg.EndMonthInclusive)
 	if err != nil {
 		return nil, fmt.Errorf("end_month: %w", err)
 	}
@@ -46,7 +39,8 @@ func Run(ctx context.Context, db *sql.DB, cfg Config) ([]models.CohortResult, er
 		periodStart := cohortStart
 		periodEnd := time.Date(cfg.Observation.Year(), cfg.Observation.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-		avg, err := database.ComputeCohortAvgFromDigest(ctx, db, tableName, cohortStart, cohortEnd, periodStart, periodEnd)
+		avg, cohortClients, eventsRead, eventsWithPrice, err :=
+			database.ComputeCohortAvgFromDigest(ctx, db, tableName, cohortStart, cohortEnd, periodStart, periodEnd)
 		if err != nil {
 			return nil, fmt.Errorf("compute %s: %w", formatMonth(cohortStart), err)
 		}
@@ -56,25 +50,29 @@ func Run(ctx context.Context, db *sql.DB, cfg Config) ([]models.CohortResult, er
 			ltv = avg.Float64
 		}
 		results = append(results, models.CohortResult{
-			MonthYear: formatMonth(cohortStart),
-			LTVAvg:    ltv,
+			MonthYear:       formatMonth(cohortStart),
+			LTVAvg:          ltv,
+			CohortClients:   cohortClients,
+			EventsRead:      eventsRead,
+			EventsWithPrice: eventsWithPrice,
 		})
 
 		_ = bar.Add(1)
 		if cfg.Verbose {
-			log.Printf("[INFO] %s -> LTV=%.6f (Digest Price × Quantity)", formatMonth(cohortStart), ltv)
+			log.Printf("[INFO] %s -> LTV=%.6f | clients=%d events=%d priced=%d",
+				formatMonth(cohortStart), ltv, cohortClients, eventsRead, eventsWithPrice)
 		}
 	}
 	return results, nil
 }
 
-// parseMonth("MMYYYY") -> 1er jour du mois en UTC (00:00:00)
+// parseMonth("MMYYYY") -> 1er jour du mois UTC
 func parseMonth(mmyyyy string) (time.Time, error) {
 	if len(mmyyyy) != 6 {
 		return time.Time{}, fmt.Errorf("format attendu MMYYYY (ex: 012025)")
 	}
-	month := (int(mmyyyy[0]-'0')*10 + int(mmyyyy[1]-'0'))
-	year := (int(mmyyyy[2]-'0')*1000 + int(mmyyyy[3]-'0')*100 + int(mmyyyy[4]-'0')*10 + int(mmyyyy[5]-'0'))
+	month := int(mmyyyy[0]-'0')*10 + int(mmyyyy[1]-'0')
+	year := int(mmyyyy[2]-'0')*1000 + int(mmyyyy[3]-'0')*100 + int(mmyyyy[4]-'0')*10 + int(mmyyyy[5]-'0')
 	if month < 1 || month > 12 {
 		return time.Time{}, fmt.Errorf("mois invalide")
 	}

@@ -6,17 +6,16 @@ import (
 	"time"
 )
 
-// EventData = ligne d'événement (CustomerEventData)
+// EventData reste disponible si tu veux tester/parsers localement plus tard.
 type EventData struct {
 	ClientCustomerID uint64
 	ExternalEventID  string
 	ContentSystemID  string
 	EventDate        time.Time
 	Quantity         int
-	DigestJSON       sql.NullString // JSON brut ; on lit price.originalUnitPrice
+	DigestJSON       sql.NullString
 }
 
-// Digest = structure minimale pour extraire le prix unitaire original
 type Digest struct {
 	Price struct {
 		OriginalUnitPrice float64 `json:"originalUnitPrice"`
@@ -24,7 +23,7 @@ type Digest struct {
 	} `json:"price"`
 }
 
-// UnitPrice retourne Digest.price.originalUnitPrice (0 si absent/JSON invalide)
+// Utilitaire (non utilisé par la voie SQL-first, mais utile pour tests futurs)
 func (e *EventData) UnitPrice() (float64, error) {
 	if !e.DigestJSON.Valid || e.DigestJSON.String == "" {
 		return 0, nil
@@ -36,14 +35,25 @@ func (e *EventData) UnitPrice() (float64, error) {
 	return d.Price.OriginalUnitPrice, nil
 }
 
-// CohortResult = "MM/YYYY ; ltv"
+// Résultat d'une cohorte + compteurs
 type CohortResult struct {
-	MonthYear string
-	LTVAvg    float64
+	MonthYear       string
+	LTVAvg          float64
+	CohortClients   int
+	EventsRead      int
+	EventsWithPrice int
 }
 
-// CohortWindow = [Start, End)
+// Borne d'un mois [Start, End)
 type CohortWindow struct {
 	Start time.Time
 	End   time.Time
+}
+
+
+type Config struct {
+	StartMonthInclusive string // "MMYYYY"
+	EndMonthInclusive   string // "MMYYYY"
+	Observation         time.Time
+	Verbose             bool
 }
