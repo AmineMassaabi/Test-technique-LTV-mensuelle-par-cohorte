@@ -15,7 +15,6 @@ import (
 
 const orderEventTypeID = 6 // "Commande"
 
-// Open DSN mariadb:// ou mysql:// → DSN driver MySQL avec loc=UTC
 func Open(dsn string) (*sql.DB, string, error) {
 	mysqlDSN, err := toMySQLDSN(dsn)
 	if err != nil {
@@ -49,9 +48,7 @@ func toMySQLDSN(dsn string) (string, error) {
 		if user == "" || host == "" || db == "" {
 			return "", fmt.Errorf("dsn incomplet (user/host/db)")
 		}
-		// loc=UTC pour cohérence avec nos bornes UTC
-		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&interpolateParams=true",
-			user, pass, host, db), nil
+		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&interpolateParams=true", user, pass, host, db), nil
 	}
 	return dsn, nil
 }
@@ -67,14 +64,12 @@ func ComputeCohortAvgFromDigest(
 		return sql.NullFloat64{}, 0, 0, 0, fmt.Errorf("table invalide")
 	}
 
-	// Bornes DATETIME en UTC
 	const layout = "2006-01-02 15:04:05"
 	cStart := cohortStart.UTC().Format(layout)
 	cEnd := cohortEnd.UTC().Format(layout)
 	pStart := periodStart.UTC().Format(layout)
 	pEnd := periodEnd.UTC().Format(layout)
 
-	// Sous-requête: clients dont la 1re commande est dans la fenêtre de cohorte
 	subCohort := fmt.Sprintf(`
 		SELECT ced.CustomerID
 		FROM %s ced
@@ -83,7 +78,6 @@ func ComputeCohortAvgFromDigest(
 		HAVING MIN(ced.EventDate) >= ? AND MIN(ced.EventDate) < ?
 	`, tableName)
 
-	// 1) Nombre de clients de cohorte
 	countCohortQ := fmt.Sprintf(`SELECT COUNT(*) FROM (%s) x`, subCohort)
 	var cohortClients int
 	if err := db.QueryRowContext(ctx, countCohortQ, orderEventTypeID, cStart, cEnd).Scan(&cohortClients); err != nil {
@@ -94,8 +88,6 @@ func ComputeCohortAvgFromDigest(
 		return sql.NullFloat64{Valid: false}, 0, 0, 0, nil
 	}
 
-	// 2) Statistiques d'événements + somme des montants
-	// price_val = CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6))
 	statsQ := fmt.Sprintf(`
 	SELECT
 		CAST(COUNT(*) AS UNSIGNED) AS events_read,
@@ -120,9 +112,7 @@ func ComputeCohortAvgFromDigest(
 	var grossTotal sql.NullFloat64
 
 	args := []any{
-		// principale (période d'observation)
 		orderEventTypeID, pStart, pEnd,
-		// sous-requête cohorte
 		orderEventTypeID, cStart, cEnd,
 	}
 	log.Printf(cStart, cEnd, pStart, pEnd)
@@ -139,7 +129,6 @@ func ComputeCohortAvgFromDigest(
 		Valid:   true,
 	}
 
-	// Logs de debug (optionnels)
 	log.Printf("[DEBUG] Cohort clients=%d | events=%d | priced=%d | gross=%.6f | ltv=%.6f",
 		cohortClients, eventsRead, eventsWithPrice, grossTotal.Float64, ltv.Float64,
 	)
