@@ -10,11 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"ltv-monthly/pkg/models"
+
 	_ "github.com/go-sql-driver/mysql"
 )
 
 const orderEventTypeID = 6 // "Commande"
 
+/*
+Open() : DSN en variable d'env possible, typé MySQL, loc=UTC
+*/
 func Open(dsn string) (*sql.DB, string, error) {
 	mysqlDSN, err := toMySQLDSN(dsn)
 	if err != nil {
@@ -48,90 +53,155 @@ func toMySQLDSN(dsn string) (string, error) {
 		if user == "" || host == "" || db == "" {
 			return "", fmt.Errorf("dsn incomplet (user/host/db)")
 		}
-		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&interpolateParams=true", user, pass, host, db), nil
+		// loc=UTC → cohérence avec Observation UTC
+		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&interpolateParams=true",
+			user, pass, host, db), nil
 	}
 	return dsn, nil
 }
 
-func ComputeCohortAvgFromDigest(
+func LoadOrderEvents(ctx context.Context, db *sql.DB, table string, obsBefore time.Time) ([]models.RawEvent, error) {
+	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
+		return nil, fmt.Errorf("table invalide")
+	}
+	const layout = "2006-01-02 15:04:05"
+	pObs := obsBefore.Format(layout)
+	q := fmt.Sprintf(`
+		SELECT
+			ced.CustomerID,
+			ced.EventDate,
+			COALESCE(ced.Quantity, 1) AS qty,
+			CAST(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice') AS DECIMAL(18,6)) AS unit_price
+		FROM %s ced
+		WHERE ced.EventTypeID = ?
+		  AND ced.EventDate < ?
+	`, table)
+
+	rows, err := db.QueryContext(ctx, q, orderEventTypeID, pObs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]models.RawEvent, 0, 1024) // todo to explain why 1024
+	var n int
+	for rows.Next() {
+		var ev models.RawEvent
+		if err := rows.Scan(&ev.CustomerID, &ev.EventDate, &ev.Quantity, &ev.UnitPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	log.Printf("[INFO] [LOAD] events: %d", n)
+	return out, nil
+}
+
+func LoadCohortCustomers(
 	ctx context.Context,
 	db *sql.DB,
-	tableName string,
-	cohortStart, cohortEnd, periodStart, periodEnd time.Time,
-) (sql.NullFloat64, int, int, int, error) {
+	table string,
+	cohortStart, cohortEnd time.Time,
+) ([]models.CohortCustomer, error) {
 
-	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(tableName) {
-		return sql.NullFloat64{}, 0, 0, 0, fmt.Errorf("table invalide")
+	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
+		return nil, fmt.Errorf("table invalide")
 	}
 
 	const layout = "2006-01-02 15:04:05"
-	cStart := cohortStart.UTC().Format(layout)
-	cEnd := cohortEnd.UTC().Format(layout)
-	pStart := periodStart.UTC().Format(layout)
-	pEnd := periodEnd.UTC().Format(layout)
+	cStart := cohortStart.Format(layout)
+	cEnd := cohortEnd.Format(layout)
 
-	subCohort := fmt.Sprintf(`
-		SELECT ced.CustomerID
+	q := fmt.Sprintf(`
+		SELECT ced.CustomerID,
+			MIN(ced.EventDate) AS firstDt
 		FROM %s ced
-		WHERE ced.EventTypeID = ?
+		WHERE ced.EventTypeID = ? AND ced.EventDate < ?
 		GROUP BY ced.CustomerID
-		HAVING MIN(ced.EventDate) >= ? AND MIN(ced.EventDate) < ?
-	`, tableName)
+		HAVING MIN(ced.EventDate) >= ?
+	`, table)
 
-	countCohortQ := fmt.Sprintf(`SELECT COUNT(*) FROM (%s) x`, subCohort)
-	var cohortClients int
-	if err := db.QueryRowContext(ctx, countCohortQ, orderEventTypeID, cStart, cEnd).Scan(&cohortClients); err != nil {
-		return sql.NullFloat64{}, 0, 0, 0, err
+	rows, err := db.QueryContext(ctx, q, orderEventTypeID, cEnd, cStart)
+	if err != nil {
+		return nil, err
 	}
-	if cohortClients == 0 {
-		// Rien à calculer ; remonter compteurs à 0
-		return sql.NullFloat64{Valid: false}, 0, 0, 0, nil
+	defer rows.Close()
+
+	out := make([]models.CohortCustomer, 0, 1024)
+	count := 0
+	for rows.Next() {
+		var r models.CohortCustomer
+		if err := rows.Scan(&r.CustomerID, &r.FirstOrderDT); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
-	statsQ := fmt.Sprintf(`
-	SELECT
-		CAST(COUNT(*) AS UNSIGNED) AS events_read,
-		CAST(SUM(
-			CASE
-				WHEN CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6)) > 0
-				THEN 1 ELSE 0
-			END
-		) AS UNSIGNED) AS events_with_price,
-		SUM(
-			IFNULL(CAST(JSON_UNQUOTE(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice')) AS DECIMAL(18,6)), 0)
-			* COALESCE(ced.Quantity, 1)
-		) AS gross_total
+	log.Printf("[INFO] [LOAD] cohort customers %s..%s: %d",
+		cStart, cEnd, count)
+
+	return out, nil
+}
+
+func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, table string, customersID []models.CohortCustomer, obsBefore time.Time) ([]models.RawEvent, error) {
+	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
+		return nil, fmt.Errorf("table invalide")
+	}
+	const layout = "2006-01-02 15:04:05"
+	pObs := obsBefore.Format(layout)
+
+	if len(customersID) == 0 {
+		return []models.RawEvent{}, nil
+	}
+	ids := make([]any, 0, len(customersID))
+	for _, c := range customersID {
+		ids = append(ids, c.CustomerID)
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1] // drop trailing comma
+
+	q := fmt.Sprintf(`
+		SELECT
+			ced.CustomerID,
+			ced.EventDate,
+			COALESCE(ced.Quantity, 1) AS qty,
+			CAST(JSON_EXTRACT(ced.Digest, '$.price.originalUnitPrice') AS DECIMAL(18,6)) AS unit_price
 		FROM %s ced
 		WHERE ced.EventTypeID = ?
-		  AND ced.EventDate >= ? AND ced.EventDate < ?
 		  AND ced.CustomerID IN (%s)
-	`, tableName, subCohort)
+		  AND ced.EventDate < ?
+	`, table, placeholders)
+	args := make([]any, 0, 1+len(ids)+1)
+	args = append(args, orderEventTypeID)
+	args = append(args, ids...)
+	args = append(args, pObs)
 
-	var eventsRead int
-	var eventsWithPrice int
-	var grossTotal sql.NullFloat64
-
-	args := []any{
-		orderEventTypeID, pStart, pEnd,
-		orderEventTypeID, cStart, cEnd,
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
 	}
-	log.Printf(cStart, cEnd, pStart, pEnd)
+	defer rows.Close()
 
-	if err := db.QueryRowContext(ctx, statsQ, args...).Scan(&eventsRead, &eventsWithPrice, &grossTotal); err != nil {
-		return sql.NullFloat64{}, cohortClients, 0, 0, err
+	out := make([]models.RawEvent, 0, 1024) // todo to explain why 1024
+	var n int
+	for rows.Next() {
+		var ev models.RawEvent
+		if err := rows.Scan(&ev.CustomerID, &ev.EventDate, &ev.Quantity, &ev.UnitPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+		n++
 	}
-
-	if !grossTotal.Valid {
-		return sql.NullFloat64{Valid: false}, cohortClients, eventsRead, eventsWithPrice, nil
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	ltv := sql.NullFloat64{
-		Float64: grossTotal.Float64 / float64(cohortClients),
-		Valid:   true,
-	}
-
-	log.Printf("[DEBUG] Cohort clients=%d | events=%d | priced=%d | gross=%.6f | ltv=%.6f",
-		cohortClients, eventsRead, eventsWithPrice, grossTotal.Float64, ltv.Float64,
-	)
-
-	return ltv, cohortClients, eventsRead, eventsWithPrice, nil
+	log.Printf("[INFO] [LOAD] events: %d", n)
+	return out, nil
 }
