@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    environment:
+      # Pass through from your host or compose .env file
+      LTV_MONTHLY_DSN: ${LTV_MONTHLY_DSN}
+      START_MONTH: ${START_MONTH:-032025}
+      END_MONTH: ${END_MONTH:-062025}
+      VERBOSE: ${VERBOSE:-true}
+    command:
+      - ./ltv-monthly
+      - --dsn
+      - "$LTV_MONTHLY_DSN"
+      - --start_month
+      - "$START_MONTH"
+      - --end_month
+      - "$END_MONTH"
+      - $([ "$VERBOSE" = "true" ] && echo "-v")
