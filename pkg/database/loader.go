@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-const orderEventTypeID = 6 // "Commande"
+const orderEventTypeID = 6 // "Purchase"
 
 /*
 Open() : DSN en variable d'env possible, typé MySQL, loc=UTC
@@ -29,12 +28,16 @@ func Open(dsn string) (*sql.DB, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+
+	// Configuration du pool de connexions.
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return db, mysqlDSN, nil
 }
 
+// toMySQLDSN convertit une URL de type mariadb:// ou mysql:// en une chaîne DSN standard
+// pour le driver Go. Il force l'utilisation de `loc=UTC` pour la cohérence des dates.
 func toMySQLDSN(dsn string) (string, error) {
 	if strings.HasPrefix(dsn, "mariadb://") || strings.HasPrefix(dsn, "mysql://") {
 		u, err := url.Parse(dsn)
@@ -60,14 +63,16 @@ func toMySQLDSN(dsn string) (string, error) {
 	return dsn, nil
 }
 
-func LoadOrderEvents(ctx context.Context, db *sql.DB, table string, obsBefore time.Time) ([]models.RawEvent, error) {
-	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
-		return nil, fmt.Errorf("table invalide")
-	}
+// LoadOrderEvents charge tous les événements de commande avant la date d'observation.
+// Cette fonction est utilisée dans la première version (Run) qui charge tout en mémoire.
+func LoadOrderEvents(ctx context.Context, db *sql.DB, obsBefore time.Time, cfg models.Config) ([]models.RawEventData, error) {
+	const table = "CustomerEventData"
+
 	const layout = "2006-01-02 15:04:05"
 	pObs := obsBefore.Format(layout)
 	q := fmt.Sprintf(`
 		SELECT
+			ced.EventID,
 			ced.CustomerID,
 			ced.EventDate,
 			COALESCE(ced.Quantity, 1) AS qty,
@@ -83,11 +88,11 @@ func LoadOrderEvents(ctx context.Context, db *sql.DB, table string, obsBefore ti
 	}
 	defer rows.Close()
 
-	out := make([]models.RawEvent, 0, 1024) // todo to explain why 1024
+	out := make([]models.RawEventData, 0, 1024)
 	var n int
 	for rows.Next() {
-		var ev models.RawEvent
-		if err := rows.Scan(&ev.CustomerID, &ev.EventDate, &ev.Quantity, &ev.UnitPrice); err != nil {
+		var ev models.RawEventData
+		if err := rows.Scan(&ev.EventID, &ev.CustomerID, &ev.EventDate, &ev.Quantity, &ev.UnitPrice); err != nil {
 			return nil, err
 		}
 		out = append(out, ev)
@@ -96,20 +101,96 @@ func LoadOrderEvents(ctx context.Context, db *sql.DB, table string, obsBefore ti
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	log.Printf("[INFO] [LOAD] events: %d", n)
+
+	if cfg.Verbose {
+		log.Printf("[INFO] [LOAD] events: %d", n)
+	}
 	return out, nil
 }
 
-func LoadCohortCustomers(
-	ctx context.Context,
-	db *sql.DB,
-	table string,
-	cohortStart, cohortEnd time.Time,
-) ([]models.CohortCustomer, error) {
+// LoadOrderEvents charge tous les événements de commande avant la date d'observation.
+// Cette fonction est utilisée dans la première version (Run) qui charge tout en mémoire.
+func LoadOrdersInsertDate(ctx context.Context, db *sql.DB, eventsData []models.RawEventData, obsBefore time.Time, cfg models.Config) ([]models.RawEventsInsertDate, error) {
+	const table = "CustomerEvent"
+	const chunkSize = 1000
 
-	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
-		return nil, fmt.Errorf("table invalide")
+	const layout = "2006-01-02 15:04:05"
+	pObs := obsBefore.Format(layout)
+
+	if len(eventsData) == 0 {
+		return []models.RawEventsInsertDate{}, nil
 	}
+
+	idsSet := make(map[uint64]struct{}, len(eventsData))
+	for _, e := range eventsData {
+		idsSet[e.EventID] = struct{}{}
+	}
+	ids := make([]uint64, 0, len(idsSet))
+	for id := range idsSet {
+		ids = append(ids, id)
+	}
+
+	out := make([]models.RawEventsInsertDate, 0, len(ids)) // capacité approximative
+	// 2) Parcours par lots
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+
+		// placeholders "?, ?, ?, ..."
+		ph := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+
+		q := fmt.Sprintf(`
+            SELECT ce.EventID, ce.InsertDate
+            FROM %s ce
+            WHERE ce.EventID IN (%s)
+              AND ce.InsertDate < ?
+        `, table, ph)
+
+		// 3) Args: les IDs du lot + la borne de date
+		args := make([]any, 0, len(batch)+1)
+		for _, id := range batch {
+			args = append(args, int64(id))
+		}
+		args = append(args, pObs)
+
+		rows, err := db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		func() {
+			defer rows.Close()
+			for rows.Next() {
+				var ev models.RawEventsInsertDate
+				if err := rows.Scan(&ev.EventID, &ev.InsertDate); err != nil {
+					out = nil
+				}
+				out = append(out, ev)
+			}
+		}()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if cfg.Verbose {
+			log.Printf("[INFO] [LOAD] chunk %d..%d/%d (batch=%d)", start, end, len(ids), len(batch))
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+	if cfg.Verbose {
+		log.Printf("[INFO] [LOAD] events Insert Dates total: %d", len(out))
+	}
+	return out, nil
+}
+
+// LoadCohortCustomers récupère les clients dont la première commande se situe dans l'intervalle de temps spécifié, les identifiant ainsi comme membres des cohortes de cette période.
+func LoadCohortCustomers(ctx context.Context, db *sql.DB, cohortStart, cohortEnd time.Time, cfg models.Config) ([]models.CohortCustomer, error) {
+	const table = "CustomerEventData"
 
 	const layout = "2006-01-02 15:04:05"
 	cStart := cohortStart.Format(layout)
@@ -144,28 +225,29 @@ func LoadCohortCustomers(
 		return nil, err
 	}
 
-	log.Printf("[INFO] [LOAD] cohort customers %s..%s: %d",
-		cStart, cEnd, count)
-
+	if cfg.Verbose {
+		log.Printf("[INFO] [LOAD] cohort customers %s..%s: %d", cStart, cEnd, count)
+	}
 	return out, nil
 }
 
-func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, table string, customersID []models.CohortCustomer, obsBefore time.Time) ([]models.RawEvent, error) {
-	if !regexp.MustCompile(`^[A-Za-z0-9_]+$`).MatchString(table) {
-		return nil, fmt.Errorf("table invalide")
-	}
+// LoadOrderEventsWithCustomersID charge tous les événements de commande pour une liste spécifique de clients, avant la date d'observation.
+func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, customersID []models.CohortCustomer, obsBefore time.Time, cfg models.Config) ([]models.RawEventData, error) {
+	const table = "CustomerEventData"
+
 	const layout = "2006-01-02 15:04:05"
 	pObs := obsBefore.Format(layout)
 
 	if len(customersID) == 0 {
-		return []models.RawEvent{}, nil
+		return []models.RawEventData{}, nil
 	}
 	ids := make([]any, 0, len(customersID))
 	for _, c := range customersID {
 		ids = append(ids, c.CustomerID)
 	}
-	placeholders := strings.Repeat("?,", len(ids))
-	placeholders = placeholders[:len(placeholders)-1] // drop trailing comma
+
+	customersIDs := strings.Repeat("?,", len(ids))
+	customersIDs = customersIDs[:len(customersIDs)-1]
 
 	q := fmt.Sprintf(`
 		SELECT
@@ -177,8 +259,8 @@ func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, table strin
 		WHERE ced.EventTypeID = ?
 		  AND ced.CustomerID IN (%s)
 		  AND ced.EventDate < ?
-	`, table, placeholders)
-	args := make([]any, 0, 1+len(ids)+1)
+	`, table, customersIDs)
+	args := make([]any, 0, len(ids)+2)
 	args = append(args, orderEventTypeID)
 	args = append(args, ids...)
 	args = append(args, pObs)
@@ -189,10 +271,10 @@ func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, table strin
 	}
 	defer rows.Close()
 
-	out := make([]models.RawEvent, 0, 1024) // todo to explain why 1024
+	out := make([]models.RawEventData, 0, 1024)
 	var n int
 	for rows.Next() {
-		var ev models.RawEvent
+		var ev models.RawEventData
 		if err := rows.Scan(&ev.CustomerID, &ev.EventDate, &ev.Quantity, &ev.UnitPrice); err != nil {
 			return nil, err
 		}
@@ -202,6 +284,8 @@ func LoadOrderEventsWithCustomersID(ctx context.Context, db *sql.DB, table strin
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	log.Printf("[INFO] [LOAD] events: %d", n)
+	if cfg.Verbose {
+		log.Printf("[INFO] [LOAD] events by CustomerID: %d", n)
+	}
 	return out, nil
 }
