@@ -24,11 +24,12 @@ This command-line tool, written in Go, calculates the average monthly Customer L
 
 1.  First, build the executable file:
     ```sh
+    go mod tidy
     go build -o ltv-monthly .
     ```
 2.  Then, run the tool with the required command-line arguments:
     ```sh
-    ./ltv-monthly --dsn="user:pass@tcp(host:port)/dbname" --start_month="MMYYYY" --end_month="MMYYYY"
+    ./ltv-monthly --dsn="user:pass@host:port/dbname" --start_month="MMYYYY" --end_month="MMYYYY"
     ```
 
 ---
@@ -36,7 +37,7 @@ This command-line tool, written in Go, calculates the average monthly Customer L
 ## 📋 Command-Line Arguments
 
 - `--dsn` (Required): The Data Source Name to connect to your MySQL database.
-  - **Format**: `user:password@tcp(hostname:port)/database_name`
+  - **Format**: `user:password@hostname:port/database_name`
 - `--start_month` (Required): The first cohort month to calculate (inclusive).
   - **Format**: `MMYYYY` (e.g., `012025` for January 2025).
 - `--end_month` (Required): The last cohort month to calculate (inclusive).
@@ -53,7 +54,7 @@ This command-line tool, written in Go, calculates the average monthly Customer L
 #### Example
 
 ```sh
-./ltv-monthly --dsn="root:secret@tcp(127.0.0.1:3306)/datafy" --start_month="012025" --end_month="082025"
+./ltv-monthly --dsn="root:secret@127.0.0.1:3306/datafy" --start_month="012025" --end_month="082025"
 ```
 
 ---
